@@ -38,6 +38,7 @@ class _CRG(Module):
         self.rst = Signal()
         self.clock_domains.cd_sys       = ClockDomain()
         self.clock_domains.cd_eth       = ClockDomain()
+        self.clock_domains.cd_vga       = ClockDomain(reset_less=True)
         if with_dram:
             self.clock_domains.cd_sys4x     = ClockDomain(reset_less=True)
             self.clock_domains.cd_sys4x_dqs = ClockDomain(reset_less=True)
@@ -57,6 +58,8 @@ class _CRG(Module):
         pll.create_clkout(self.cd_sys, sys_clk_freq)
         pll.create_clkout(self.cd_eth, 25e6)
         self.comb += platform.request("eth_ref_clk").eq(self.cd_eth.clk)
+        pll.create_clkout(self.cd_vga, 40e6)
+
         platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
         if with_dram:
             pll.create_clkout(self.cd_sys4x,     4*sys_clk_freq)
@@ -126,6 +129,24 @@ class BaseSoC(SoCCore):
         if with_pmod_gpio:
             platform.add_extension(arty.raw_pmod_io("pmoda"))
             self.submodules.gpio = GPIOTristate(platform.request("pmoda"))
+
+        with_video_framebuffer = True
+        if with_video_framebuffer:
+            from litex.build.generic_platform import Pins, IOStandard, Subsignal
+            platform.add_extension([("vga", 0, #PMOD VGA on pmod B & C
+                Subsignal("hsync", Pins("U14")), #pmodc.4
+                Subsignal("vsync", Pins("V14")), #pmodc.5
+                Subsignal("r", Pins("E15 E16 D15 C15")), #pmodb.0-3
+                Subsignal("g", Pins("U12 V12 V10 V11")), #pmodc.0-3
+                Subsignal("b", Pins("J17 J18 K15 J15")), #pmodb.4-7
+                IOStandard("LVCMOS33"))])
+
+            from litex.soc.cores.video import VideoVGAPHY
+            self.submodules.videophy = VideoVGAPHY(platform.request("vga"), clock_domain="vga")
+            #self.add_video_framebuffer(phy=self.videophy, timings="800x600@60Hz", clock_domain="vga", format="rgb565") #this brings errors
+            #self.add_video_framebuffer(phy=self.videophy, timings="640x480@60Hz", clock_domain="vga")
+            self.add_video_framebuffer(phy=self.videophy, timings="800x600@60Hz", clock_domain="vga")
+
 
 # Build --------------------------------------------------------------------------------------------
 
