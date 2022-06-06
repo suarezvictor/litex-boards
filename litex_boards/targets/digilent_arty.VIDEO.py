@@ -61,6 +61,91 @@ set_property -dict {PACKAGE_PIN V11 IOSTANDARD LVCMOS33} [get_ports {vga_g[3]}];
 set_property -dict {PACKAGE_PIN U14 IOSTANDARD LVCMOS33} [get_ports {vga_hsync}];
 set_property -dict {PACKAGE_PIN V14 IOSTANDARD LVCMOS33} [get_ports {vga_vsync}];
 """
+
+from litex.soc.interconnect import stream
+from litex.soc.cores.video import video_data_layout
+from litex.build.io import SDROutput, DDROutput
+from litex.soc.cores.code_tmds import TMDSEncoder
+class Open(Signal): pass
+class VideoS7HDMI10to1Serializer_CUSTOM(Module):
+    def __init__(self, data_i, data_o, clock_domain):
+        # Note: 2 OSERDESE2 are coupled for 10:1 Serialization (8:1 Max with one).
+
+        # Map Input Data to OSERDESE2 Master/Slave.
+        data_m = Signal(8)
+        data_s = Signal(8)
+        self.comb += data_m[0:8].eq(data_i[:8]) # D1 to D8
+        self.comb += data_s[2:4].eq(data_i[8:]) # D3 to D4
+
+        # OSERDESE2 Master/Slave.
+        shift = Signal(2)
+        for data, serdes in zip([data_m, data_s], ["master", "slave"]):
+            self.specials += Instance("OSERDESE2",
+                # Parameters
+                p_DATA_WIDTH     = 10,
+                p_TRISTATE_WIDTH = 1,
+                p_DATA_RATE_OQ   = "DDR",
+                p_DATA_RATE_TQ   = "DDR",
+                p_SERDES_MODE    = serdes.upper(),
+
+                # Controls.
+                i_OCE    = 1,
+                i_TCE    = 0,
+                i_RST    = ResetSignal(clock_domain),
+                i_CLK    = ClockSignal("sys"),
+                i_CLKDIV = ClockSignal(clock_domain),
+
+                # Datas.
+                **{f"i_D{n+1}": data[n] for n in range(8)},
+
+                # Master/Slave shift in/out.
+                i_SHIFTIN1  = shift[0] if serdes == "master" else 0,
+                i_SHIFTIN2  = shift[1] if serdes == "master" else 0,
+                o_SHIFTOUT1 = shift[0] if serdes == "slave"  else 0,
+                o_SHIFTOUT2 = shift[1] if serdes == "slave"  else 0,
+
+                # Output
+                o_OQ = data_o if serdes == "master" else Open(),
+            )
+            
+class VideoS7HDMIPHY_CUSTOM(Module):
+    def __init__(self, pads, clock_domain="sys"):
+        self.sink = sink = stream.Endpoint(video_data_layout)
+
+        # # #
+
+        # Always ack Sink, no backpressure.
+        self.comb += sink.ready.eq(1)
+
+        # Clocking + Differential Signaling.
+        pads_clk = Signal()
+        self.specials += DDROutput(i1=1, i2=0, o=pads_clk, clk=ClockSignal(clock_domain))
+        self.specials += Instance("OBUFDS", i_I=pads_clk, o_O=pads.clk_p, o_OB=pads.clk_n)
+
+        # Encode/Serialize Datas.
+        for color in ["r", "g", "b"]:
+
+            # TMDS Encoding.
+            encoder = ClockDomainsRenamer(clock_domain)(TMDSEncoder())
+            self.submodules += encoder
+            self.comb += encoder.d.eq(getattr(sink, color))
+            self.comb += encoder.c.eq(Cat(sink.hsync, sink.vsync) if color == "r" else 0)
+            self.comb += encoder.de.eq(sink.de)
+
+            # 10:1 Serialization + Differential Signaling.
+            pad_o = Signal()
+            serializer = VideoS7HDMI10to1Serializer_CUSTOM(
+                data_i       = encoder.out,
+                data_o       = pad_o,
+                clock_domain = clock_domain,
+            )
+            self.submodules += serializer
+            c2d   = {"r": 0, "g": 1, "b": 2}
+            pad_p = getattr(pads, f"data{c2d[color]}_p")
+            pad_n = getattr(pads, f"data{c2d[color]}_n")
+            self.specials += Instance("OBUFDS", i_I=pad_o, o_O=pad_p, o_OB=pad_n)
+
+
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(Module):
@@ -81,16 +166,24 @@ class _CRG(Module):
         pll.create_clkout(self.cd_sys,       sys_clk_freq)
         pll.create_clkout(self.cd_sys4x,     4*sys_clk_freq)
         pll.create_clkout(self.cd_sys4x_dqs, 4*sys_clk_freq, phase=90)
-        pll.create_clkout(self.cd_idelay,    200e6)
+        if sys_clk_freq > 100e6 and sys_clk_freq < 200e6:
+           pll.create_clkout(self.cd_idelay,    sys_clk_freq)
+        else:
+            pll.create_clkout(self.cd_idelay,    200e6)
+
         if False:
             pll.create_clkout(self.cd_eth,       25e6)
 
-        video_clock = 25e6 #"800x600@75Hz" =>  49.5e6, "640x480@60Hz" => 25.175e6 "800x600@60Hz"  => 40e6, 1280x720@60Hz(RB) => 61.9e6 1024 46.42e6
+        video_clock = 40.e6 if DVI else 25.e6 #"800x600@75Hz" =>  49.5e6, "640x480@60Hz" => 25.175e6 "800x600@60Hz"  => 40e6, "800x600@50Hz"=> 33.3..e6 1280x720@60Hz(RB) => 61.9e6 1024 46.42e6
         if DVI:
             self.clock_domains.cd_hdmi   = ClockDomain()
-            self.clock_domains.cd_hdmi5x = ClockDomain()
             pll.create_clkout(self.cd_hdmi,     video_clock, margin=1e-3)
-            #pll.create_clkout(self.cd_hdmi5x, 5*video_clock, margin=1e-3)
+            if int(video_clock*5) != sys_clk_freq:
+              self.clock_domains.cd_hdmi5x = ClockDomain()
+              pll.create_clkout(self.cd_hdmi5x, 5*video_clock, margin=1e-3)
+            else:
+              print(f"shared HDMI 5x clock @{sys_clk_freq/1e6}Mhz")
+              #quit()
         else:
             #self.clock_domains.cd_vga       = ClockDomain(reset_less=True)
             self.clock_domains.cd_vga       = ClockDomain(reset_less=False) #TODO: chech why True brings errors
@@ -135,6 +228,7 @@ class BaseSoC(SoCCore):
                 sys_clk_freq   = sys_clk_freq)
             self.add_sdram("sdram",
                 phy           = self.ddrphy,
+                #module        = MT41K128M16(sys_clk_freq, "1:4" if int(sys_clk_freq) < int(200e6) else "1:2"),
                 module        = MT41K128M16(sys_clk_freq, "1:4"),
                 l2_cache_size = kwargs.get("l2_size", 8192)
             )
@@ -154,14 +248,14 @@ class BaseSoC(SoCCore):
             self.add_jtagbone()
 
         # Flash (through LiteSPI, experimental).
-        if with_mapped_flash:
+        if False: #with_mapped_flash:
             self.submodules.spiflash_phy  = LiteSPIPHY(platform.request("spiflash4x"), S25FL128L(Codes.READ_1_1_4))
             self.submodules.spiflash_mmap = LiteSPI(self.spiflash_phy, clk_freq=sys_clk_freq, mmap_endianness=self.cpu.endianness)
             spiflash_region = SoCRegion(origin=self.mem_map.get("spiflash", None), size=S25FL128L.total_size, cached=False)
             self.bus.add_slave(name="spiflash", slave=self.spiflash_mmap.bus, region=spiflash_region)
 
         # SPI Flash --------------------------------------------------------------------------------
-        if with_spi_flash:
+        if False: #if with_spi_flash:
             from litespi.modules import S25FL128L
             from litespi.opcodes import SpiNorFlashOpCodes as Codes
             self.add_spi_flash(mode="4x", module=S25FL128L(Codes.READ_1_1_4), with_master=True)
@@ -209,8 +303,9 @@ class BaseSoC(SoCCore):
                 Subsignal("clk_p",   Pins("pmodc:6"), IOStandard("TMDS_33")),
                 Subsignal("clk_n",   Pins("pmodc:7"), IOStandard("TMDS_33")))])
             from litex.soc.cores.video import VideoS7HDMIPHY
-            self.submodules.videophy = VideoS7HDMIPHY(platform.request("hdmi_out"), clock_domain="hdmi")
-            self.add_video_framebuffer(phy=self.videophy, timings="640x480@60Hz", clock_domain="hdmi", format="rgb888") #FIXME: issue 1198
+            self.submodules.videophy = VideoS7HDMIPHY_CUSTOM(platform.request("hdmi_out"), clock_domain="hdmi")
+            #self.add_video_framebuffer(phy=self.videophy, timings="640x480@60Hz", clock_domain="hdmi", format="rgb888") #FIXME: issue 1198
+            self.add_video_framebuffer(phy=self.videophy, timings="800x600@60Hz", clock_domain="hdmi", format="rgb888") #FIXME: issue 1198
         elif with_video_framebuffer:
             platform.add_extension([("vga", 0, #PMOD VGA on pmod B & C
                 Subsignal("hsync", Pins("U14")), #pmodc.4
@@ -225,7 +320,8 @@ class BaseSoC(SoCCore):
             
         if with_video_framebuffer:
             port = self.sdram.crossbar.get_port(mode="write")
-            dma_width = 32 #port.data_width if port.data_width < 64 else 64 #using a wider bus optimizes access
+            #dma_width = 32 #FIXED, framebuffer is access DMA-only and not by software
+            dma_width = port.data_width if port.data_width < 64 else 64 #using a wider bus optimizes access, uses software correction
             self.blitter = Blitter(port=self.sdram.crossbar.get_port(mode="write", data_width=dma_width))
             self.submodules.blitter = self.blitter
         
