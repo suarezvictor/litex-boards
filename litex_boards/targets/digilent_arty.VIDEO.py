@@ -34,7 +34,7 @@ from litespi.opcodes import SpiNorFlashOpCodes as Codes
 from litespi.phy.generic import LiteSPIPHY
 from litespi import LiteSPI
 
-DVI = False
+DVI = True
 
 
 """
@@ -174,7 +174,7 @@ class _CRG(Module):
         if False:
             pll.create_clkout(self.cd_eth,       25e6)
 
-        video_clock = 40.e6 if DVI else 25.e6 #"800x600@75Hz" =>  49.5e6, "640x480@60Hz" => 25.175e6 "800x600@60Hz"  => 40e6, "800x600@50Hz"=> 33.3..e6 1280x720@60Hz(RB) => 61.9e6 1024 46.42e6
+        video_clock = 100.e6/3 if DVI else 25.e6 #"800x600@75Hz" =>  49.5e6, "640x480@60Hz" => 25.175e6 "800x600@60Hz"  => 40e6, "800x600@50Hz"=> 33.3..e6 1280x720@60Hz(RB) => 61.9e6 1024 46.42e6
         if DVI:
             self.clock_domains.cd_hdmi   = ClockDomain()
             pll.create_clkout(self.cd_hdmi,     video_clock, margin=1e-3)
@@ -346,6 +346,8 @@ class BaseSoC(SoCCore):
             self.comb += self.dma_reader.source.connect(self.dma_writer.sink) #Connect Reader to Writer
 
 # Build --------------------------------------------------------------------------------------------
+# (DVI=False, 640x480@60Hz) ./digilent_arty.VIDEO.py --timer-uptime --uart-baudrate=1000000 --with-pmod-gpio --integrated-sram-size 32768 --sys-clk-freq=200e6     --cpu-type=vexriscv --cpu-variant=full --build
+# (DVI=True,  800x600@50Hz) ./digilent_arty.VIDEO.py --timer-uptime --uart-baudrate=1000000 --with-pmod-gpio --integrated-sram-size 32768 --sys-clk-freq=166666666 --cpu-type=vexriscv --cpu-variant=full --build
 
 def main():
     parser = argparse.ArgumentParser(description="LiteX SoC on Arty A7")
